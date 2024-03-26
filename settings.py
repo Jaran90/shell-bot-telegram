@@ -10,7 +10,7 @@ IS_HEROKU = os.environ.get("IS_HEROKU", False)
 
 # Set users to -999999 to disable user authentication
 ENABLED_USERS = os.environ.get("ENABLED_USERS","")
-ENABLED_USERS = set(int(e.strip(ignore)) for e in ENABLED_USERS.split(","))  # type: ignore
+ENABLED_USERS = set(int(e.strip("ignore")) for e in ENABLED_USERS.split(","))  # type: ignore
 
 CMD_WHITE_LIST = set()
 CMD_BLACK_LIST = {"rm"}
