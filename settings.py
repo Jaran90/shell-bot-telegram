@@ -1,7 +1,7 @@
 import os
 
 TOKEN = os.environ.get(
-    "TELEGRAM_API_TOKEN", "6632123417:AAF7hnSz8aZdhSVzNzwgJvfx1lpasy0UUlE"
+    "TELEGRAM_API_TOKEN","6632123417:AAF7hnSz8aZdhSVzNzwgJvfx1lpasy0UUlE"
 )
 
 PORT = int(os.environ.get("PORT", "8443"))
